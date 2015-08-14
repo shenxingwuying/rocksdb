@@ -33,21 +33,22 @@
     #define PLATFORM_IS_LITTLE_ENDIAN false
   #endif
 #elif defined(OS_FREEBSD)
-  #include <sys/endian.h>
-  #include <sys/types.h>
+  #include <sys/endian.h> // noling
+  #include <sys/types.h> // nolint
   #define PLATFORM_IS_LITTLE_ENDIAN (_BYTE_ORDER == _LITTLE_ENDIAN)
 #elif defined(OS_OPENBSD) || defined(OS_NETBSD) ||\
       defined(OS_DRAGONFLYBSD) || defined(OS_ANDROID)
-  #include <sys/types.h>
-  #include <sys/endian.h>
+  #include <sys/types.h> // nolint
+  #include <sys/endian.h> // nolint
 #else
   #include <endian.h>
 #endif
 #include <pthread.h>
 
 #include <stdint.h>
-#include <string>
 #include <string.h>
+#include <limits>
+#include <string>
 
 #ifndef PLATFORM_IS_LITTLE_ENDIAN
 #define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
@@ -73,8 +74,6 @@
 // when targetting older platforms.
 #define fdatasync fsync
 #endif
-
-#include <limits>
 
 namespace rocksdb {
 namespace port {
@@ -144,6 +143,17 @@ class CondVar {
   pthread_cond_t cv_;
   Mutex* mu_;
 };
+
+static inline void AsmVolatilePause() {
+#if defined(__i386__) || defined(__x86_64__)
+  asm volatile("pause");
+#elif defined(__aarch64__)
+  asm volatile("wfe");
+#elif defined(__powerpc64__)
+  asm volatile("or 27,27,27");
+#endif
+  // it's okay for other platforms to be no-ops
+}
 
 typedef pthread_once_t OnceType;
 #define LEVELDB_ONCE_INIT PTHREAD_ONCE_INIT

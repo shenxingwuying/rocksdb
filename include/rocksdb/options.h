@@ -1147,6 +1147,15 @@ struct DBOptions {
   // Default: 1MB/s
   uint64_t delayed_write_rate;
 
+  // If true, allow multi-writers to update mem tables in parallel.
+  // Only some memtable_factory-s support concurrent writes; currently
+  // it is implemented for SkipListFactory and HashSkipListRepFactory.
+  //
+  // THIS FEATURE IS NOT STABLE YET.
+  //
+  // Default: false
+  bool allow_concurrent_memtable_write;
+
   // If true, then DB::Open() will not update the statistics used to optimize
   // compaction decision by loading table properties from many files.
   // Turning off this feature will improve DBOpen time especially in

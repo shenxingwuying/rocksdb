@@ -28,7 +28,11 @@ class HashSkipListRep : public MemTableRep {
                   size_t bucket_size, int32_t skiplist_height,
                   int32_t skiplist_branching_factor);
 
+  virtual bool IsInsertConcurrentlySupported() const override { return true; }
+
   virtual void Insert(KeyHandle handle) override;
+
+  virtual void InsertConcurrently(KeyHandle handle) override;
 
   virtual bool Contains(const char* key) const override;
 
@@ -78,6 +82,8 @@ class HashSkipListRep : public MemTableRep {
   // Get a bucket from buckets_. If the bucket hasn't been initialized yet,
   // initialize it before returning.
   Bucket* GetInitializedBucket(const Slice& transformed);
+  // Returns an initialized bucket for a key that is not already in the table
+  Bucket* GetBucketForInsert(const char* key);
 
   class Iterator : public MemTableRep::Iterator {
    public:
@@ -250,20 +256,37 @@ HashSkipListRep::Bucket* HashSkipListRep::GetInitializedBucket(
   size_t hash = GetHash(transformed);
   auto bucket = GetBucket(hash);
   if (bucket == nullptr) {
-    auto addr = allocator_->AllocateAligned(sizeof(Bucket));
+    char* addr;
+    {
+      SpinMutex::Lock lock(allocator_->Mutex());
+      addr = allocator_->AllocateAligned(sizeof(Bucket));
+    }
     bucket = new (addr) Bucket(compare_, allocator_, skiplist_height_,
                                skiplist_branching_factor_);
-    buckets_[hash].store(bucket, std::memory_order_release);
+    Bucket* existing = nullptr;
+    buckets_[hash].compare_exchange_strong(existing, bucket,
+                                           std::memory_order_release);
+    if (existing != nullptr) {
+      bucket = existing;
+    }
   }
   return bucket;
 }
 
-void HashSkipListRep::Insert(KeyHandle handle) {
-  auto* key = static_cast<char*>(handle);
+HashSkipListRep::Bucket* HashSkipListRep::GetBucketForInsert(const char* key) {
   assert(!Contains(key));
   auto transformed = transform_->Transform(UserKey(key));
-  auto bucket = GetInitializedBucket(transformed);
-  bucket->Insert(key);
+  return GetInitializedBucket(transformed);
+}
+
+void HashSkipListRep::Insert(KeyHandle handle) {
+  auto* key = static_cast<const char*>(handle);
+  GetBucketForInsert(key)->Insert(key);
+}
+
+void HashSkipListRep::InsertConcurrently(KeyHandle handle) {
+  auto* key = static_cast<const char*>(handle);
+  GetBucketForInsert(key)->InsertConcurrently(key);
 }
 
 bool HashSkipListRep::Contains(const char* key) const {

@@ -9,6 +9,7 @@
 #include <deque>
 #include <set>
 #include <vector>
+#include "util/instrumented_mutex.h"
 
 namespace rocksdb {
 

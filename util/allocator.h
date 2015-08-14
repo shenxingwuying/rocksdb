@@ -13,6 +13,8 @@
 #pragma once
 #include <cstddef>
 #include <cerrno>
+#include "port/port.h"
+#include "util/mutexlock.h"
 
 namespace rocksdb {
 
@@ -27,6 +29,13 @@ class Allocator {
                                 Logger* logger = nullptr) = 0;
 
   virtual size_t BlockSize() const = 0;
+
+  // Allocators are not thread-safe, but they colocate a spinlock for
+  // the convenience callers
+  SpinMutex& Mutex() { return mutex_; }
+
+ private:
+  SpinMutex mutex_;
 };
 
 }  // namespace rocksdb

@@ -3402,6 +3402,9 @@ Status DBImpl::CreateColumnFamily(const ColumnFamilyOptions& cf_options,
   *handle = nullptr;
 
   s = CheckCompressionSupported(cf_options);
+  if (s.ok() && db_options_.allow_concurrent_memtable_write) {
+    s = CheckConcurrentWritesSupported(cf_options);
+  }
   if (!s.ok()) {
     return s;
   }
@@ -3803,7 +3806,6 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   w.sync = write_options.sync;
   w.disableWAL = write_options.disableWAL;
   w.in_batch_group = false;
-  w.done = false;
   w.has_callback = (callback != nullptr) ? true : false;
 
   if (!write_options.disableWAL) {
@@ -3813,12 +3815,30 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   StopWatch write_sw(env_, db_options_.statistics.get(), DB_WRITE);
 
   write_thread_.JoinBatchGroup(&w);
-  if (w.done) {
-    // write was done by someone else, no need to grab mutex
+  if (w.state == WriteThread::STATE_PARALLEL_FOLLOWER) {
+    // we are a non-leader in a parallel group
+    PERF_TIMER_GUARD(write_memtable_time);
+
+    ColumnFamilyMemTablesImpl column_family_memtables(
+        versions_->GetColumnFamilySet(), nullptr);
+    WriteBatchInternal::SetSequence(w.batch, w.sequence);
+    w.status = WriteBatchInternal::InsertInto(
+        w.batch, &column_family_memtables,
+        write_options.ignore_missing_column_families,
+        /*log_number*/ 0, this, /*dont_filter_deletes*/ true,
+        /*concurrent_memtable_writes*/ true, /*cfd_set*/ &w.cfd_set);
+
+    write_thread_.CompleteParallelFollower(&w);
+    assert(w.state == WriteThread::STATE_COMMITTED);
+    // STATE_COMMITTED conditional below handles exit
+  }
+  if (w.state == WriteThread::STATE_COMMITTED) {
+    // write is complete and leader has updated sequence
     RecordTick(stats_, WRITE_DONE_BY_OTHER);
     return w.status;
   }
   // else we are the leader of the write batch group
+  assert(w.state == WriteThread::STATE_GROUP_LEADER);
 
   WriteContext context;
   mutex_.Lock();
@@ -3948,12 +3968,28 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
   // At this point the mutex is unlocked
 
   if (status.ok()) {
+    // Rules for when we can update the memtable concurrently
+    // 1. supported by memtable
+    // 2. Puts are not okay if inplace_update_support
+    // 3. Deletes or SingleDeletes are not okay if filtering deletes
+    //    (controlled by both batch and memtable setting)
+    // 4. Merges are not okay
+    //
+    // Rules 1..3 are enforced by checking the options
+    // during startup (CheckConcurrentWritesSupported), so if
+    // options.allow_concurrent_memtable_write is true then they
+    // can be assumed to be true.  Rule 4 is checked for each batch.
+    // We could relax rules 2 and 3 if we could prevent write batches
+    // from referring more than once to a particular key.
+    bool parallel = db_options_.allow_concurrent_memtable_write &&
+                    write_batch_group.size() > 1;
       int total_count = 0;
       uint64_t total_byte_size = 0;
       for (auto b : write_batch_group) {
         total_count += WriteBatchInternal::Count(b);
         total_byte_size = WriteBatchInternal::AppendedByteSize(
             total_byte_size, WriteBatchInternal::ByteSize(b));
+        parallel = parallel && !b->HasMerge();
       }
 
       const SequenceNumber current_sequence = last_sequence + 1;
@@ -4027,10 +4063,31 @@ Status DBImpl::WriteImpl(const WriteOptions& write_options,
       if (status.ok()) {
         PERF_TIMER_GUARD(write_memtable_time);
 
-        status = WriteBatchInternal::InsertInto(
-            write_batch_group, current_sequence, column_family_memtables_.get(),
-            write_options.ignore_missing_column_families,
-            /*log_number*/ 0, this, /*dont_filter_deletes*/ false);
+        if (!parallel) {
+          status = WriteBatchInternal::InsertInto(
+              write_batch_group, current_sequence,
+              column_family_memtables_.get(),
+              write_options.ignore_missing_column_families,
+              /*log_number*/ 0, this, /*dont_filter_deletes*/ false);
+        } else {
+          write_thread_.LaunchParallelFollowers(&w, last_writer,
+                                                current_sequence);
+
+          ColumnFamilyMemTablesImpl column_family_memtables(
+              versions_->GetColumnFamilySet(), nullptr);
+          assert(w.sequence == current_sequence);
+          WriteBatchInternal::SetSequence(w.batch, w.sequence);
+          w.status = WriteBatchInternal::InsertInto(
+              w.batch, &column_family_memtables,
+              write_options.ignore_missing_column_families,
+              /*log_number*/ 0, this, /*dont_filter_deletes*/ true,
+              /*concurrent_memtable_writes*/ true, /*cfd_set*/ &w.cfd_set);
+
+          status = write_thread_.JoinParallelFollowers(&w, last_writer);
+
+          // Flush scheduling was deferred during parallel work, do it now
+          write_thread_.CheckMemtableFull(&w, last_writer, &flush_scheduler_);
+        }
 
         // A non-OK status here indicates that the state implied by the
         // WAL has diverged from the in-memory state.  This could be
@@ -4804,6 +4861,9 @@ Status DB::Open(const DBOptions& db_options, const std::string& dbname,
 
   for (auto& cfd : column_families) {
     s = CheckCompressionSupported(cfd.options);
+    if (s.ok() && db_options.allow_concurrent_memtable_write) {
+      s = CheckConcurrentWritesSupported(cfd.options);
+    }
     if (!s.ok()) {
       return s;
     }

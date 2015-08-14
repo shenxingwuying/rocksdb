@@ -4,23 +4,30 @@
 //  of patent rights can be found in the PATENTS file in the same directory.
 
 #include "db/write_thread.h"
+#include "db/column_family.h"
 
 namespace rocksdb {
 
-void WriteThread::Await(Writer* w) {
-  std::unique_lock<std::mutex> guard(w->JoinMutex());
-  w->JoinCV().wait(guard, [w] { return w->joined; });
+void WriteThread::AwaitStateExit(Writer* w, uint8_t state_to_exit) {
+  std::unique_lock<std::mutex> guard(w->StateMutex());
+  w->StateCV().wait(guard,
+                    [w, state_to_exit] { return w->state != state_to_exit; });
 }
 
-void WriteThread::MarkJoined(Writer* w) {
-  std::lock_guard<std::mutex> guard(w->JoinMutex());
-  assert(!w->joined);
-  w->joined = true;
-  w->JoinCV().notify_one();
+void WriteThread::AwaitCommitted(Writer* w) {
+  std::unique_lock<std::mutex> guard(w->StateMutex());
+  w->StateCV().wait(guard, [w] { return w->state == STATE_COMMITTED; });
 }
 
-void WriteThread::LinkOne(Writer* w, bool* wait_needed) {
-  assert(!w->joined && !w->done);
+void WriteThread::SetState(Writer* w, uint8_t new_state) {
+  std::lock_guard<std::mutex> guard(w->StateMutex());
+  assert(w->state != new_state);
+  w->state = new_state;
+  w->StateCV().notify_one();
+}
+
+void WriteThread::LinkOne(Writer* w, bool* linked_as_leader) {
+  assert(w->state == STATE_INIT);
 
   Writer* writers = newest_writer_.load(std::memory_order_relaxed);
   while (true) {
@@ -29,8 +36,10 @@ void WriteThread::LinkOne(Writer* w, bool* wait_needed) {
       w->CreateMutex();
     }
     if (newest_writer_.compare_exchange_strong(writers, w)) {
-      // Success.
-      *wait_needed = (writers != nullptr);
+      if (writers == nullptr) {
+        w->state = STATE_GROUP_LEADER;
+      }
+      *linked_as_leader = (writers == nullptr);
       return;
     }
   }
@@ -50,10 +59,10 @@ void WriteThread::CreateMissingNewerLinks(Writer* head) {
 
 void WriteThread::JoinBatchGroup(Writer* w) {
   assert(w->batch != nullptr);
-  bool wait_needed;
-  LinkOne(w, &wait_needed);
-  if (wait_needed) {
-    Await(w);
+  bool linked_as_leader;
+  LinkOne(w, &linked_as_leader);
+  if (!linked_as_leader) {
+    AwaitStateExit(w, STATE_INIT);
   }
 }
 
@@ -87,7 +96,7 @@ size_t WriteThread::EnterAsBatchGroupLeader(
   // This is safe regardless of any db mutex status of the caller. Previous
   // calls to ExitAsGroupLeader either didn't call CreateMissingNewerLinks
   // (they emptied the list and then we added ourself as leader) or had to
-  // explicitly wake up us (the list was non-empty when we added ourself,
+  // explicitly wake us up (the list was non-empty when we added ourself,
   // so we have already received our MarkJoined).
   CreateMissingNewerLinks(newest_writer);
 
@@ -134,6 +143,66 @@ size_t WriteThread::EnterAsBatchGroupLeader(
   return size;
 }
 
+void WriteThread::CompleteParallelFollower(Writer* w) {
+  assert(w->state == STATE_PARALLEL_FOLLOWER);
+  SetState(w, STATE_AWAITING_PARALLEL_COMMIT);
+}
+
+void WriteThread::LaunchParallelFollowers(Writer* leader, Writer* last_writer,
+                                          SequenceNumber sequence) {
+  // EnterAsBatchGroupLeader already created the links from leader to
+  // newer writers in the group
+
+  Writer* w = leader;
+  WriteBatchInternal::SetSequence(w->batch, sequence);
+
+  while (w != last_writer) {
+    sequence += WriteBatchInternal::Count(w->batch);
+    w = w->link_newer;
+
+    WriteBatchInternal::SetSequence(w->batch, sequence);
+    assert(w->state == STATE_INIT);
+    SetState(w, STATE_PARALLEL_FOLLOWER);
+  }
+}
+
+Status WriteThread::JoinParallelFollowers(Writer* leader, Writer* last_writer) {
+  Writer* w = leader;
+  Status status = w->status;
+
+  while (w != last_writer) {
+    w = w->link_newer;
+
+    AwaitStateExit(w, STATE_PARALLEL_FOLLOWER);
+    assert(w->state == STATE_AWAITING_PARALLEL_COMMIT);
+    if (status.ok()) {
+      status = w->status;
+    }
+  }
+  return status;
+}
+
+void WriteThread::CheckMemtableFull(Writer* leader, Writer* last_writer,
+                                    FlushScheduler* flush_scheduler) {
+  // There's not much point in trying to remove duplicates from the
+  // cfd_set-s, because ShouldScheduleFlush() is very cheap.
+
+  Writer* w = leader;
+  while (true) {
+    for (auto* cfd : w->cfd_set) {
+      if (cfd->mem()->ShouldScheduleFlush()) {
+        flush_scheduler->ScheduleFlush(cfd);
+        cfd->mem()->MarkFlushScheduled();
+      }
+    }
+
+    if (w == last_writer) {
+      break;
+    }
+    w = w->link_newer;
+  }
+}
+
 void WriteThread::ExitAsBatchGroupLeader(Writer* leader, Writer* last_writer,
                                          Status status) {
   assert(leader->link_older == nullptr);
@@ -165,30 +234,32 @@ void WriteThread::ExitAsBatchGroupLeader(Writer* leader, Writer* last_writer,
     // nullptr when they enqueued (we were definitely enqueued before them
     // and are still in the list).  That means leader handoff occurs when
     // we call MarkJoined
-    MarkJoined(last_writer->link_newer);
+    SetState(last_writer->link_newer, STATE_GROUP_LEADER);
   }
   // else nobody else was waiting, although there might already be a new
   // leader now
 
   while (last_writer != leader) {
     last_writer->status = status;
-    last_writer->done = true;
-    // We must read link_older before calling MarkJoined, because as
-    // soon as it is marked the other thread's AwaitJoined may return
-    // and deallocate the Writer.
+
+    // we need to read ink_older before calling SetState, because as soon
+    // as it is marked committed the other thread's Await may return and
+    // deallocate the Writer.
     auto next = last_writer->link_older;
-    MarkJoined(last_writer);
+    SetState(last_writer, STATE_COMMITTED);
+
     last_writer = next;
   }
 }
 
 void WriteThread::EnterUnbatched(Writer* w, InstrumentedMutex* mu) {
   assert(w->batch == nullptr);
-  bool wait_needed;
-  LinkOne(w, &wait_needed);
-  if (wait_needed) {
+  bool linked_as_leader;
+  LinkOne(w, &linked_as_leader);
+  if (!linked_as_leader) {
     mu->Unlock();
-    Await(w);
+    AwaitStateExit(w, STATE_INIT);
+    assert(w->state == STATE_GROUP_LEADER);
     mu->Lock();
   }
 }

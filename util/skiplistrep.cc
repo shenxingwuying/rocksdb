@@ -25,10 +25,16 @@ public:
       transform_(transform), lookahead_(lookahead) {
   }
 
+  virtual bool IsInsertConcurrentlySupported() const override { return true; }
+
   // Insert key into the list.
   // REQUIRES: nothing that compares equal to key is currently in the list.
   virtual void Insert(KeyHandle handle) override {
     skip_list_.Insert(static_cast<char*>(handle));
+  }
+
+  virtual void InsertConcurrently(KeyHandle handle) override {
+    skip_list_.InsertConcurrently(static_cast<char*>(handle));
   }
 
   // Returns true iff an entry that compares equal to key is in the list.

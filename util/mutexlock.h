@@ -8,6 +8,10 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <assert.h>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include "port/port.h"
 
 namespace rocksdb {
@@ -73,6 +77,58 @@ class WriteLock {
   // No copying allowed
   WriteLock(const WriteLock&);
   void operator=(const WriteLock&);
+};
+
+//
+// SpinMutex has very low overhead for low-contention cases
+//
+class SpinMutex {
+ public:
+  using Lock = std::lock_guard<SpinMutex>;
+
+  SpinMutex() : locked_(false) {}
+
+  void lock() {
+    for (size_t tries = 0;; ++tries) {
+      auto currently_locked = locked_.load(std::memory_order_relaxed);
+      if (!currently_locked &&
+          locked_.compare_exchange_weak(currently_locked, true,
+                                        std::memory_order_acquire,
+                                        std::memory_order_relaxed)) {
+        // success
+        break;
+      }
+      port::AsmVolatilePause();
+      if (tries > 100) {
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  void unlock() { locked_.store(false, std::memory_order_release); }
+
+ private:
+  std::atomic<bool> locked_;
+};
+
+//
+// CheckOnlyMutex doesn't actually block anybody, but asserts that some
+// outer locking protocol prevents two threads from ever trying to acquire
+// it at the same time.  Think of it as a mutex where waiting is replaced
+// by assert(false).
+//
+class CheckOnlyMutex {
+ public:
+  using Lock = std::lock_guard<CheckOnlyMutex>;
+
+  CheckOnlyMutex() : depth_(0) {}
+
+  void lock() { assert(depth_++ == 0); }
+
+  void unlock() { assert(depth_-- == 1); }
+
+ private:
+  std::atomic<int> depth_;
 };
 
 }  // namespace rocksdb

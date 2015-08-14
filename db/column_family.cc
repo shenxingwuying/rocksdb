@@ -110,6 +110,20 @@ Status CheckCompressionSupported(const ColumnFamilyOptions& cf_options) {
   return Status::OK();
 }
 
+Status CheckConcurrentWritesSupported(const ColumnFamilyOptions& cf_options) {
+  if (cf_options.inplace_update_support) {
+    return Status::InvalidArgument(
+        "In-place memtable updates (inplace_update_support) is not compatible "
+        "with concurrent writes (allow_concurrent_memtable_write)");
+  }
+  if (cf_options.filter_deletes) {
+    return Status::InvalidArgument(
+        "Delete filtering (filter_deletes) is not compatible with concurrent "
+        "memtable writes (allow_concurrent_memtable_writes)");
+  }
+  return Status::OK();
+}
+
 ColumnFamilyOptions SanitizeOptions(const DBOptions& db_options,
                                     const InternalKeyComparator* icmp,
                                     const ColumnFamilyOptions& src) {

@@ -258,6 +258,7 @@ DBOptions::DBOptions()
       listeners(),
       enable_thread_tracking(false),
       delayed_write_rate(1024U * 1024U),
+      allow_concurrent_memtable_write(false),
       skip_stats_update_on_db_open(false),
       wal_recovery_mode(WALRecoveryMode::kTolerateCorruptedTailRecords)
 #ifndef ROCKSDB_LITE
@@ -321,6 +322,7 @@ DBOptions::DBOptions(const Options& options)
       listeners(options.listeners),
       enable_thread_tracking(options.enable_thread_tracking),
       delayed_write_rate(options.delayed_write_rate),
+      allow_concurrent_memtable_write(options.allow_concurrent_memtable_write),
       skip_stats_update_on_db_open(options.skip_stats_update_on_db_open),
       wal_recovery_mode(options.wal_recovery_mode),
       row_cache(options.row_cache)
@@ -432,6 +434,8 @@ void DBOptions::Dump(Logger* log) const {
         wal_recovery_mode);
     Header(log, "                  Options.enable_thread_tracking: %d",
         enable_thread_tracking);
+    Warn(log, "         Options.allow_concurrent_memtable_write: %d",
+         allow_concurrent_memtable_write);
     if (row_cache) {
       Header(log, "                               Options.row_cache: %" PRIu64,
            row_cache->GetCapacity());

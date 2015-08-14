@@ -320,7 +320,7 @@ uint64_t MemTable::ApproximateSize(const Slice& start_ikey,
 
 void MemTable::Add(SequenceNumber s, ValueType type,
                    const Slice& key, /* user key */
-                   const Slice& value) {
+                   const Slice& value, bool allow_concurrent) {
   // Format of an entry is concatenation of:
   //  key_size     : varint32 of internal_key.size()
   //  key bytes    : char[internal_key.size()]
@@ -333,8 +333,16 @@ void MemTable::Add(SequenceNumber s, ValueType type,
                                internal_key_size + VarintLength(val_size) +
                                val_size;
   char* buf = nullptr;
-  KeyHandle handle = table_->Allocate(encoded_len, &buf);
-  assert(buf != nullptr);
+  KeyHandle handle;
+  {
+    std::unique_lock<SpinMutex> lock(allocator_.Mutex(), std::defer_lock);
+    if (allow_concurrent) {
+      lock.lock();
+    }
+    handle = table_->Allocate(encoded_len, &buf);
+    should_flush_ = ShouldFlushNow();
+  }
+
   char* p = EncodeVarint32(buf, internal_key_size);
   memcpy(p, key.data(), key_size);
   p += key_size;
@@ -344,32 +352,62 @@ void MemTable::Add(SequenceNumber s, ValueType type,
   p = EncodeVarint32(p, val_size);
   memcpy(p, value.data(), val_size);
   assert((unsigned)(p + val_size - buf) == (unsigned)encoded_len);
-  table_->Insert(handle);
-  num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,
+  if (!allow_concurrent) {
+    table_->Insert(handle);
+
+    // this is a bit ugly, but is the way to avoid locked instructions
+    // when incrementing an atomic
+    num_entries_.store(num_entries_.load(std::memory_order_relaxed) + 1,
+                       std::memory_order_relaxed);
+    data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_len,
                      std::memory_order_relaxed);
-  data_size_.store(data_size_.load(std::memory_order_relaxed) + encoded_len,
-                   std::memory_order_relaxed);
-  if (type == kTypeDeletion) {
-    num_deletes_++;
-  }
-
-  if (prefix_bloom_) {
-    assert(prefix_extractor_);
-    prefix_bloom_->Add(prefix_extractor_->Transform(key));
-  }
-
-  // The first sequence number inserted into the memtable
-  assert(first_seqno_ == 0 || s > first_seqno_);
-  if (first_seqno_ == 0) {
-    first_seqno_ = s;
-
-    if (earliest_seqno_ == kMaxSequenceNumber) {
-      earliest_seqno_ = first_seqno_;
+    if (type == kTypeDeletion) {
+      num_deletes_.store(num_deletes_.load(std::memory_order_relaxed) + 1,
+                         std::memory_order_relaxed);
     }
-    assert(first_seqno_ >= earliest_seqno_);
-  }
 
-  should_flush_ = ShouldFlushNow();
+    if (prefix_bloom_) {
+      assert(prefix_extractor_);
+      prefix_bloom_->Add(prefix_extractor_->Transform(key));
+    }
+
+    // The first sequence number inserted into the memtable
+    assert(first_seqno_ == 0 || s > first_seqno_);
+    if (first_seqno_ == 0) {
+      first_seqno_.store(s, std::memory_order_relaxed);
+
+      if (earliest_seqno_ == kMaxSequenceNumber) {
+        earliest_seqno_.store(GetFirstSequenceNumber(),
+                              std::memory_order_relaxed);
+      }
+      assert(first_seqno_.load() >= earliest_seqno_.load());
+    }
+  } else {
+    table_->InsertConcurrently(handle);
+
+    num_entries_.fetch_add(1, std::memory_order_relaxed);
+    data_size_.fetch_add(encoded_len, std::memory_order_relaxed);
+    if (type == kTypeDeletion) {
+      num_deletes_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (prefix_bloom_) {
+      assert(prefix_extractor_);
+      prefix_bloom_->AddConcurrently(prefix_extractor_->Transform(key));
+    }
+
+    // atomically update first_seqno_ and earliest_seqno_.
+    uint64_t cur_seq_num = first_seqno_.load(std::memory_order_relaxed);
+    while ((cur_seq_num == 0 || s < cur_seq_num) &&
+           !first_seqno_.compare_exchange_weak(cur_seq_num, s)) {
+    }
+    uint64_t cur_earliest_seqno =
+        earliest_seqno_.load(std::memory_order_relaxed);
+    while (
+        (cur_earliest_seqno == kMaxSequenceNumber || s < cur_earliest_seqno) &&
+        !first_seqno_.compare_exchange_weak(cur_earliest_seqno, s)) {
+    }
+  }
 }
 
 // Callback from MemTable::Get()

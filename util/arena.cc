@@ -137,6 +137,7 @@ char* Arena::AllocateAligned(size_t bytes, size_t huge_page_size,
                              Logger* logger) {
   assert((kAlignUnit & (kAlignUnit - 1)) ==
          0);  // Pointer size should be a power of 2
+  CheckOnlyMutex::Lock assert_not_concurrent(race_checker_);
 
 #ifdef MAP_HUGETLB
   if (huge_page_size > 0 && bytes > 0) {

@@ -52,9 +52,14 @@ class SkipList {
   explicit SkipList(Comparator cmp, Allocator* allocator,
                     int32_t max_height = 12, int32_t branching_factor = 4);
 
-  // Insert key into the list.
+  // Insert key into the list under external synchronization
+  // REQUIRES: no concurrent calls to Insert or InsertConcurrently
   // REQUIRES: nothing that compares equal to key is currently in the list.
   void Insert(const Key& key);
+
+  // Insert key into the list, with no external synchronization required
+  // REQUIRES: nothing that compares equal to key is currently in the list.
+  void InsertConcurrently(const Key& key);
 
   // Returns true iff an entry that compares equal to key is in the list.
   bool Contains(const Key& key) const;
@@ -117,12 +122,12 @@ class SkipList {
 
   Node* const head_;
 
-  // Modified only by Insert().  Read racily by readers, but stale
+  // Modified only during insertion.  Read racily by readers, but stale
   // values are ok.
   std::atomic<int> max_height_;  // Height of the entire list
 
   // Used for optimizing sequential insert patterns.  Tricky.  prev_[i] for
-  // i up to max_height_ is the predecessor of prev_[0] and prev_height_
+  // i up to max_height_ is the predecessor of prev_[0].  prev_height_
   // is the height of prev_[0].  prev_[0] can only be equal to head before
   // insertion, in which case max_height_ and prev_height_ are 1.
   Node** prev_;
@@ -132,7 +137,9 @@ class SkipList {
     return max_height_.load(std::memory_order_relaxed);
   }
 
+  char* AllocateUninitializedNode(int height);
   Node* NewNode(const Key& key, int height);
+  Node* NewNodeConcurrently(const Key& key, int height);
   int RandomHeight();
   bool Equal(const Key& a, const Key& b) const { return (compare_(a, b) == 0); }
 
@@ -152,6 +159,15 @@ class SkipList {
   // Return the last node in the list.
   // Return head_ if list is empty.
   Node* FindLast() const;
+
+  // Traverses a single level of the list, setting *out_prev to the last
+  // node before the key and *out_next to the first node after. Assumes
+  // that the key is not present in the skip list. On entry, before should
+  // point to a node that is before the key, and after should point to
+  // a node that is after the key.  after should be nullptr if a good after
+  // node isn't conveniently available.
+  void FindLevelSplice(const Key& key, Node* before, Node* after, int level,
+                       Node** out_prev, Node** out_next);
 
   // No copying allowed
   SkipList(const SkipList&);
@@ -180,6 +196,11 @@ struct SkipList<Key, Comparator>::Node {
     next_[n].store(x, std::memory_order_release);
   }
 
+  bool CASNext(int n, Node* expected, Node* x) {
+    assert(n >= 0);
+    return next_[n].compare_exchange_strong(expected, x);
+  }
+
   // No-barrier variants that can be safely used in a few locations.
   Node* NoBarrier_Next(int n) {
     assert(n >= 0);
@@ -195,12 +216,27 @@ struct SkipList<Key, Comparator>::Node {
   std::atomic<Node*> next_[1];
 };
 
-template<typename Key, class Comparator>
+template <typename Key, class Comparator>
+char* SkipList<Key, Comparator>::AllocateUninitializedNode(int height) {
+  return allocator_->AllocateAligned(sizeof(Node) +
+                                     sizeof(std::atomic<Node*>) * (height - 1));
+}
+
+template <typename Key, class Comparator>
+typename SkipList<Key, Comparator>::Node* SkipList<Key, Comparator>::NewNode(
+    const Key& key, int height) {
+  return new (AllocateUninitializedNode(height)) Node(key);
+}
+
+template <typename Key, class Comparator>
 typename SkipList<Key, Comparator>::Node*
-SkipList<Key, Comparator>::NewNode(const Key& key, int height) {
-  char* mem = allocator_->AllocateAligned(
-      sizeof(Node) + sizeof(std::atomic<Node*>) * (height - 1));
-  return new (mem) Node(key);
+SkipList<Key, Comparator>::NewNodeConcurrently(const Key& key, int height) {
+  char* raw;
+  {
+    SpinMutex::Lock lock(allocator_->Mutex());
+    raw = AllocateUninitializedNode(height);
+  }
+  return new (raw) Node(key);
 }
 
 template<typename Key, class Comparator>
@@ -462,6 +498,66 @@ void SkipList<Key, Comparator>::Insert(const Key& key) {
   }
   prev_[0] = x;
   prev_height_ = height;
+}
+
+template <typename Key, class Comparator>
+void SkipList<Key, Comparator>::FindLevelSplice(const Key& key, Node* before,
+                                                Node* after, int level,
+                                                Node** out_prev,
+                                                Node** out_next) {
+  while (true) {
+    Node* next = before->Next(level);
+    assert(before == head_ || next == nullptr ||
+           KeyIsAfterNode(next->key, before));
+    assert(before == head_ || KeyIsAfterNode(key, before));
+    if (next == after || !KeyIsAfterNode(key, next)) {
+      // found it
+      *out_prev = before;
+      *out_next = next;
+      return;
+    }
+    before = next;
+  }
+}
+
+template <typename Key, class Comparator>
+void SkipList<Key, Comparator>::InsertConcurrently(const Key& key) {
+  int height = RandomHeight();
+
+  int max_height = max_height_.load(std::memory_order_relaxed);
+  while (height > max_height) {
+    if (max_height_.compare_exchange_strong(max_height, height)) {
+      // successfully updated it
+      max_height = height;
+      break;
+    }
+    // else retry
+  }
+
+  Node* x = NewNodeConcurrently(key, height);
+
+  Node* prev[max_height + 1];
+  Node* next[max_height + 1];
+  prev[max_height] = head_;
+  next[max_height] = nullptr;
+  for (int i = max_height - 1; i >= 0; --i) {
+    FindLevelSplice(key, prev[i + 1], next[i + 1], i, &prev[i], &next[i]);
+  }
+  for (int i = 0; i < height; ++i) {
+    while (true) {
+      x->NoBarrier_SetNext(i, next[i]);
+      if (prev[i]->CASNext(i, next[i], x)) {
+        // success
+        break;
+      }
+      // CAS failed, we need to recompute prev and next. It is unlikely
+      // to be helpful to try to use a different level as we redo the
+      // search, because it should be unlikely that lots of nodes have
+      // been inserted between prev[i] and next[i]. No point in using
+      // next[i] as the after hint, because we know it is stale.
+      FindLevelSplice(key, prev[i], nullptr, i, &prev[i], &next[i]);
+    }
+  }
 }
 
 template<typename Key, class Comparator>

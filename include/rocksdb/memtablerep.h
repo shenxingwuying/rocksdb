@@ -77,8 +77,14 @@ class MemTableRep {
   // Insert key into the collection. (The caller will pack key and value into a
   // single buffer and pass that in as the parameter to Insert).
   // REQUIRES: nothing that compares equal to key is currently in the
-  // collection.
+  // collection, and no concurrent modifications to the table in progress
   virtual void Insert(KeyHandle handle) = 0;
+
+  // Like Insert(handle), but may be called concurrent with other calls
+  // to InsertConcurrently for other handles
+  virtual void InsertConcurrently(KeyHandle handle) {
+    throw std::runtime_error("concurrent insert not supported");
+  }
 
   // Returns true iff an entry that compares equal to key is in the collection.
   virtual bool Contains(const char* key) const = 0;
@@ -173,6 +179,10 @@ class MemTableRep {
   // Return true if the current MemTableRep supports snapshot
   // Default: true
   virtual bool IsSnapshotSupported() const { return true; }
+
+  // Return true if the current MemTableRep supports concurrent inserts
+  // Default: false
+  virtual bool IsInsertConcurrentlySupported() const { return false; }
 
  protected:
   // When *key is an internal key concatenated with the value, returns the

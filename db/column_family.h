@@ -24,7 +24,6 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
-#include "util/instrumented_mutex.h"
 #include "util/mutable_cf_options.h"
 #include "util/thread_local.h"
 
@@ -131,6 +130,9 @@ struct SuperVersion {
 };
 
 extern Status CheckCompressionSupported(const ColumnFamilyOptions& cf_options);
+
+extern Status CheckConcurrentWritesSupported(
+    const ColumnFamilyOptions& cf_options);
 
 extern ColumnFamilyOptions SanitizeOptions(const DBOptions& db_options,
                                            const InternalKeyComparator* icmp,
@@ -499,9 +501,17 @@ class ColumnFamilyMemTablesImpl : public ColumnFamilyMemTables {
         current_(nullptr),
         flush_scheduler_(flush_scheduler) {}
 
+  // Constructs a ColumnFamilyMemTablesImpl equivalent to one constructed
+  // with the arguments used to construct *orig.
+  explicit ColumnFamilyMemTablesImpl(ColumnFamilyMemTablesImpl* orig)
+      : column_family_set_(orig->column_family_set_),
+        current_(nullptr),
+        flush_scheduler_(orig->flush_scheduler_) {}
+
   // sets current_ to ColumnFamilyData with column_family_id
   // returns false if column family doesn't exist
-  // REQUIRES: under a DB mutex OR from a write thread
+  // REQUIRES: use this function of DBImpl::column_family_memtables_ should be
+  //           under a DB mutex OR from a write thread
   bool Seek(uint32_t column_family_id) override;
 
   // Returns log number of the selected column family
@@ -509,15 +519,23 @@ class ColumnFamilyMemTablesImpl : public ColumnFamilyMemTables {
   uint64_t GetLogNumber() const override;
 
   // REQUIRES: Seek() called first
-  // REQUIRES: under a DB mutex OR from a write thread
+  // REQUIRES: use this function of DBImpl::column_family_memtables_ should be
+  //           under a DB mutex OR from a write thread
   virtual MemTable* GetMemTable() const override;
 
   // Returns column family handle for the selected column family
-  // REQUIRES: under a DB mutex OR from a write thread
+  // REQUIRES: use this function of DBImpl::column_family_memtables_ should be
+  //           under a DB mutex OR from a write thread
   virtual ColumnFamilyHandle* GetColumnFamilyHandle() override;
 
-  // REQUIRES: under a DB mutex OR from a write thread
+  // REQUIRES: use this function of DBImpl::column_family_memtables_ should be
+  //           under a DB mutex OR from a write thread
   virtual void CheckMemtableFull() override;
+
+  // Cannot be called while another thread is calling Seek().
+  // REQUIRES: use this function of DBImpl::column_family_memtables_ should be
+  //           under a DB mutex OR from a write thread
+  virtual ColumnFamilyData* current() { return current_; }
 
  private:
   ColumnFamilySet* column_family_set_;

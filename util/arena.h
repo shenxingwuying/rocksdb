@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <stdint.h>
 #include "util/allocator.h"
+#include "util/mutexlock.h"
 
 namespace rocksdb {
 
@@ -61,6 +62,7 @@ class Arena : public Allocator {
   // by the arena (exclude the space allocated but not yet used for future
   // allocations).
   size_t ApproximateMemoryUsage() const {
+    CheckOnlyMutex::Lock assert_not_concurrent(race_checker_);
     return blocks_memory_ + blocks_.capacity() * sizeof(char*) -
            alloc_bytes_remaining_;
   }
@@ -76,7 +78,11 @@ class Arena : public Allocator {
   size_t BlockSize() const override { return kBlockSize; }
 
  private:
-  char inline_block_[kInlineSize];
+  // Checks mutual exclusion in debug mode, doesn't actually enforce
+  // anything
+  mutable CheckOnlyMutex race_checker_;
+
+  char inline_block_[kInlineSize] __attribute__((aligned(sizeof(void*))));
   // Number of bytes allocated in one block
   const size_t kBlockSize;
   // Array of new[] allocated memory blocks
@@ -117,6 +123,7 @@ inline char* Arena::Allocate(size_t bytes) {
   // The semantics of what to return are a bit messy if we allow
   // 0-byte allocations, so we disallow them here (we don't need
   // them for our internal use).
+  CheckOnlyMutex::Lock assert_not_concurrent(race_checker_);
   assert(bytes > 0);
   if (bytes <= alloc_bytes_remaining_) {
     unaligned_alloc_ptr_ -= bytes;

@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <vector>
 #include "rocksdb/types.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/db.h"
@@ -17,6 +18,7 @@
 namespace rocksdb {
 
 class MemTable;
+class ColumnFamilyData;
 
 class ColumnFamilyMemTables {
  public:
@@ -29,6 +31,7 @@ class ColumnFamilyMemTables {
   virtual MemTable* GetMemTable() const = 0;
   virtual ColumnFamilyHandle* GetColumnFamilyHandle() = 0;
   virtual void CheckMemtableFull() = 0;
+  virtual ColumnFamilyData* current() { return nullptr; }
 };
 
 class ColumnFamilyMemTablesDefault : public ColumnFamilyMemTables {
@@ -127,19 +130,29 @@ class WriteBatchInternal {
   //
   // If log_number is non-zero, the memtable will be updated only if
   // memtables->GetLogNumber() >= log_number.
+  //
+  // This function checks if a memtable needs to be flushed afterward,
+  // unless concurrent_memtable_writes is true.  In that mode, tables to
+  // check for flush are accumulated into cfd_set.  Under concurrent use,
+  // the caller is responsible for making sure that the memtables object
+  // itself is thread-local.
   static Status InsertInto(const autovector<WriteBatch*>& batches,
                            SequenceNumber sequence,
                            ColumnFamilyMemTables* memtables,
                            bool ignore_missing_column_families = false,
                            uint64_t log_number = 0, DB* db = nullptr,
-                           const bool dont_filter_deletes = true);
+                           const bool dont_filter_deletes = true,
+                           bool concurrent_memtable_writes = false,
+                           std::vector<ColumnFamilyData*>* cfd_set = nullptr);
 
   // Convenience form of InsertInto when you have only one batch
   static Status InsertInto(const WriteBatch* batch,
                            ColumnFamilyMemTables* memtables,
                            bool ignore_missing_column_families = false,
                            uint64_t log_number = 0, DB* db = nullptr,
-                           const bool dont_filter_deletes = true);
+                           const bool dont_filter_deletes = true,
+                           bool concurrent_memtable_writes = false,
+                           std::vector<ColumnFamilyData*>* cfd_set = nullptr);
 
   static void Append(WriteBatch* dst, const WriteBatch* src);
 
