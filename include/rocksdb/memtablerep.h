@@ -36,6 +36,7 @@
 #pragma once
 
 #include <memory>
+#include <stdexcept>
 #include <stdint.h>
 
 namespace rocksdb {

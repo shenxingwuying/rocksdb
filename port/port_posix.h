@@ -33,13 +33,13 @@
     #define PLATFORM_IS_LITTLE_ENDIAN false
   #endif
 #elif defined(OS_FREEBSD)
-  #include <sys/endian.h> // noling
-  #include <sys/types.h> // nolint
+#include <sys/endian.h>  // noling
+#include <sys/types.h>   // nolint
   #define PLATFORM_IS_LITTLE_ENDIAN (_BYTE_ORDER == _LITTLE_ENDIAN)
 #elif defined(OS_OPENBSD) || defined(OS_NETBSD) ||\
       defined(OS_DRAGONFLYBSD) || defined(OS_ANDROID)
-  #include <sys/types.h> // nolint
-  #include <sys/endian.h> // nolint
+#include <sys/types.h>   // nolint
+#include <sys/endian.h>  // nolint
 #else
   #include <endian.h>
 #endif

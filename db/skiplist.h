@@ -32,8 +32,9 @@
 
 #pragma once
 #include <assert.h>
-#include <atomic>
 #include <stdlib.h>
+#include <atomic>
+#include <utility>
 #include "port/port.h"
 #include "util/allocator.h"
 #include "util/random.h"
@@ -112,6 +113,8 @@ class SkipList {
   };
 
  private:
+  enum MaxPossibleHeightEnum : uint16_t { kMaxPossibleHeight = 32 };
+
   const uint16_t kMaxHeight_;
   const uint16_t kBranching_;
   const uint32_t kScaledInverseBranching_;
@@ -302,11 +305,13 @@ int SkipList<Key, Comparator>::RandomHeight() {
 
   // Increase height with probability 1 in kBranching
   int height = 1;
-  while (height < kMaxHeight_ && rnd->Next() < kScaledInverseBranching_) {
+  while (height < kMaxHeight_ && height < kMaxPossibleHeight &&
+         rnd->Next() < kScaledInverseBranching_) {
     height++;
   }
   assert(height > 0);
   assert(height <= kMaxHeight_);
+  assert(height <= kMaxPossibleHeight);
   return height;
 }
 
@@ -434,7 +439,7 @@ SkipList<Key, Comparator>::SkipList(const Comparator cmp, Allocator* allocator,
       max_height_(1),
       prev_height_(1) {
   assert(max_height > 0 && kMaxHeight_ == static_cast<uint32_t>(max_height));
-  assert(branching_factor > 0 &&
+  assert(branching_factor > 1 &&
          kBranching_ == static_cast<uint32_t>(branching_factor));
   assert(kScaledInverseBranching_ > 0);
   // Allocate the prev_ Node* array, directly from the passed-in allocator.
@@ -533,11 +538,12 @@ void SkipList<Key, Comparator>::InsertConcurrently(const Key& key) {
     }
     // else retry
   }
+  assert(max_height <= kMaxPossibleHeight);
 
   Node* x = NewNodeConcurrently(key, height);
 
-  Node* prev[max_height + 1];
-  Node* next[max_height + 1];
+  Node* prev[kMaxPossibleHeight + 1];
+  Node* next[kMaxPossibleHeight + 1];
   prev[max_height] = head_;
   next[max_height] = nullptr;
   for (int i = max_height - 1; i >= 0; --i) {
