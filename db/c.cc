@@ -5569,6 +5569,21 @@ void rocksdb_lru_cache_options_set_memory_allocator(
   opt->rep.memory_allocator = allocator->rep;
 }
 
+void rocksdb_lru_cache_options_set_strict_capacity_limit(
+    rocksdb_lru_cache_options_t* opt, bool value) {
+  opt->rep.strict_capacity_limit = value;
+}
+
+void rocksdb_lru_cache_options_set_high_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt, double ratio) {
+  opt->rep.high_pri_pool_ratio = ratio;
+}
+
+void rocksdb_lru_cache_options_set_low_pri_pool_ratio(
+    rocksdb_lru_cache_options_t* opt, double ratio) {
+  opt->rep.low_pri_pool_ratio = ratio;
+}
+
 rocksdb_cache_t* rocksdb_cache_create_lru(size_t capacity) {
   rocksdb_cache_t* c = new rocksdb_cache_t;
   c->rep = NewLRUCache(capacity);
